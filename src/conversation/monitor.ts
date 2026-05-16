@@ -6,7 +6,7 @@
 
 import { AccountManager } from '../account/manager';
 import { ConfigManager } from '../config/manager';
-import type { ConversationMessage, WebhookConfig } from '../types';
+import type { ConversationMessage, AskMessage, WebhookConfig } from '../types';
 import { MinaHTTPClient } from '../mina/client';
 
 // ===== 类型定义 =====
@@ -24,12 +24,22 @@ interface DeviceMonitorState {
   isRunning: boolean;
 }
 
-/** 监听器状态 */
+/** 监听器状态（与 WASM 版 MonitorStatus 一致） */
 export interface MonitorStatus {
-  enabled: boolean;
-  messageCount: number;
-  monitoredDevices: number;
-  webhookCount: number;
+  is_enabled: boolean;
+  device_count: number;
+  devices: DeviceMonitorStatusItem[];
+  webhook_count: number;
+  message_count: number;
+}
+
+/** 设备监听状态项（与 WASM 版 DeviceMonitorStatusItem 一致） */
+export interface DeviceMonitorStatusItem {
+  account_id: string;
+  device_id: string;
+  device_name: string;
+  is_running: boolean;
+  last_timestamp_ms: number;
 }
 
 // ===== ConversationMonitor =====
@@ -69,37 +79,44 @@ export class ConversationMonitor {
   /**
    * 启动对话监听
    * 遍历所有 managed 设备，启动定时轮询
-   * @param onNewMessage - 可选的新消息回调（语音口令引擎使用）
+   * 回调通过 registerCallback() 独立注册，start() 只管启停
    */
-  start(onNewMessage?: ConversationCallback): void {
-    if (this.enabled) {
+  start(): void {
+    // 已启动且定时器正在运行，直接返回
+    if (this.enabled && this.pollTimer !== null) {
       mimusic.log.info('[ConversationMonitor] Already running, skip start');
       return;
     }
 
-    this.enabled = true;
-
-    // 注册回调
-    if (onNewMessage) {
-      this.callbacks.set('__default__', onNewMessage);
+    // 清理残留的定时器
+    if (this.pollTimer !== null) {
+      clearInterval(this.pollTimer);
+      this.pollTimer = null;
     }
 
-    // 初始化设备监听状态
+    this.enabled = true;
+
+    // 刷新设备列表
     this.refreshDevices();
+
+    // 标记所有设备为运行中
+    for (const dm of this.devices.values()) {
+      dm.isRunning = true;
+    }
 
     // 启动定时轮询
     this.pollTimer = setInterval(() => {
       this.pollAll();
     }, this.pollInterval);
 
-    mimusic.log.info(`[ConversationMonitor] Started, devices=${this.devices.size} interval=${this.pollInterval}ms`);
+    mimusic.log.info(`[ConversationMonitor] Started, devices=${this.devices.size} callbacks=${this.callbacks.size}`);
   }
 
   /**
    * 停止对话监听
    */
   stop(): void {
-    if (!this.enabled) {
+    if (!this.enabled && this.pollTimer === null) {
       return;
     }
 
@@ -115,7 +132,7 @@ export class ConversationMonitor {
       dm.isRunning = false;
     }
 
-    mimusic.log.info(`[ConversationMonitor] Stopped, devices=${this.devices.size}`);
+    mimusic.log.info(`[ConversationMonitor] Stopped`);
   }
 
   /**
@@ -154,7 +171,7 @@ export class ConversationMonitor {
 
     // 按时间戳过滤
     if (sinceTimestampMs > 0) {
-      result = result.filter(msg => msg.timestamp > sinceTimestampMs);
+      result = result.filter(msg => msg.message.timestamp_ms > sinceTimestampMs);
     }
 
     // 限制返回条数（取最新的）
@@ -162,19 +179,31 @@ export class ConversationMonitor {
       result = result.slice(result.length - limit);
     }
 
+    mimusic.log.info(`[ConversationMonitor] getMessages total_stored=${this.messages.length} returning=${result.length} (limit=${limit} sinceTs=${sinceTimestampMs})`);
     return result;
   }
 
   /**
-   * 获取监听器状态
+   * 获取监听器状态（与 WASM 版一致）
    */
   getStatus(): MonitorStatus {
     const webhooks = this.configManager.getWebhooks();
+    const devices: DeviceMonitorStatusItem[] = [];
+    for (const dm of this.devices.values()) {
+      devices.push({
+        account_id: dm.accountId,
+        device_id: dm.deviceId,
+        device_name: dm.deviceName,
+        is_running: dm.isRunning,
+        last_timestamp_ms: dm.lastTimestampMs,
+      });
+    }
     return {
-      enabled: this.enabled,
-      messageCount: this.messages.length,
-      monitoredDevices: this.devices.size,
-      webhookCount: webhooks.length,
+      is_enabled: this.enabled,
+      device_count: this.devices.size,
+      devices,
+      webhook_count: webhooks.length,
+      message_count: this.messages.length,
     };
   }
 
@@ -262,16 +291,28 @@ export class ConversationMonitor {
       return;
     }
 
-    // 获取对话记录
-    let messages: ConversationMessage[];
+    // 获取对话记录（返回 AskMessage[]）
+    let askMessages: AskMessage[];
     try {
-      messages = client.getLatestAskFromXiaoai(dm.deviceId, dm.hardware, 5);
+      askMessages = client.getLatestAskFromXiaoai(dm.deviceId, dm.hardware, 5);
     } catch (e) {
       mimusic.log.warn(`[ConversationMonitor] Failed to get conversations: ${dm.deviceId} ${String(e)}`);
       return;
     }
 
-    if (!messages || messages.length === 0) {
+    // 打印返回的消息数量和内容摘要
+    const msgCount = askMessages ? askMessages.length : 0;
+    if (msgCount > 0) {
+      const summary = askMessages.map(m => {
+        const q = m.response?.answer?.[0]?.question ?? '?';
+        return `[ts=${m.timestamp_ms} q="${q.substring(0, 50)}"]`;
+      }).join(', ');
+      mimusic.log.info(`[ConversationMonitor] pollDevice device=${dm.deviceId} returned ${msgCount} messages: ${summary}`);
+    } else {
+      mimusic.log.info(`[ConversationMonitor] pollDevice device=${dm.deviceId} returned 0 messages`);
+    }
+
+    if (!askMessages || askMessages.length === 0) {
       return;
     }
 
@@ -279,14 +320,24 @@ export class ConversationMonitor {
     const newMessages: ConversationMessage[] = [];
     let maxTimestamp = dm.lastTimestampMs;
 
-    for (const msg of messages) {
-      if (msg.timestamp > dm.lastTimestampMs) {
-        newMessages.push(msg);
-        if (msg.timestamp > maxTimestamp) {
-          maxTimestamp = msg.timestamp;
+    for (const askMsg of askMessages) {
+      if (askMsg.timestamp_ms > dm.lastTimestampMs) {
+        // 构造完整的 ConversationMessage（与 WASM 版一致）
+        const convMsg: ConversationMessage = {
+          account_id: dm.accountId,
+          device_id: dm.deviceId,
+          device_name: dm.deviceName,
+          message: askMsg,
+        };
+        newMessages.push(convMsg);
+        if (askMsg.timestamp_ms > maxTimestamp) {
+          maxTimestamp = askMsg.timestamp_ms;
         }
       }
     }
+
+    // 打印过滤结果
+    mimusic.log.info(`[ConversationMonitor] pollDevice device=${dm.deviceId} after filter: ${newMessages.length} new (lastTimestampMs=${dm.lastTimestampMs})`);
 
     if (newMessages.length === 0) {
       return;
@@ -297,6 +348,9 @@ export class ConversationMonitor {
 
     // 追加到全局消息缓冲区
     for (const msg of newMessages) {
+      const q = msg.message?.response?.answer?.[0]?.question ?? '?';
+      const a = msg.message?.response?.answer?.[0]?.content ?? '?';
+      mimusic.log.info(`[ConversationMonitor] addMessage ts=${msg.message.timestamp_ms} q="${q.substring(0, 80)}" a="${a.substring(0, 80)}"`);
       this.addMessage(msg);
     }
 

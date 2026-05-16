@@ -216,9 +216,11 @@ export class PlaylistManager {
    */
   getStatus(): PlayerStatus {
     let currentSong: { id: number; title: string; artist: string } | undefined;
+    let duration = 0;
     if (this.currentIndex >= 0 && this.currentIndex < this.songs.length) {
       const song = this.songs[this.currentIndex];
       currentSong = { id: song.id, title: song.title, artist: song.artist };
+      duration = song.duration;
     }
 
     return {
@@ -227,6 +229,9 @@ export class PlaylistManager {
       playlist_id: this.playlistId,
       current_index: this.currentIndex,
       current_song: currentSong,
+      position: this.getPosition(),
+      duration: duration,
+      is_playing: this.state === 'playing',
     };
   }
 

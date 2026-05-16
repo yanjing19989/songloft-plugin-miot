@@ -26,7 +26,7 @@ export const SERVICE_TOKEN_VALID_HOURS = 12;
 export const TOKEN_REFRESH_THRESHOLD_HOURS = 3;
 
 /** 小爱对话记录 API 模板 */
-export const LATEST_ASK_API_TEMPLATE = 'https://userprofile.mina.mi.com/device_profile/v2/conversation?source=dialogu&hardware=%s&timestamp=%d&limit=2';
+export const LATEST_ASK_API_TEMPLATE = 'https://userprofile.mina.mi.com/device_profile/v2/conversation?source=dialogu&hardware=%s&timestamp=%d&limit=%l';
 
 /** 最大重定向次数 */
 export const MAX_REDIRECTS = 10;
@@ -96,6 +96,6 @@ export function formatUserAgent(deviceId: string): string {
 /**
  * 格式化对话记录API URL
  */
-export function formatLatestAskUrl(hardware: string, timestamp: number): string {
-  return LATEST_ASK_API_TEMPLATE.replace('%s', hardware).replace('%d', String(timestamp));
+export function formatLatestAskUrl(hardware: string, timestamp: number, limit = 2): string {
+  return LATEST_ASK_API_TEMPLATE.replace('%s', hardware).replace('%d', String(timestamp)).replace('%l', String(limit));
 }

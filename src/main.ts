@@ -9,6 +9,7 @@ import { Scheduler } from './schedule/scheduler';
 import { TaskExecutor } from './schedule/executor';
 import { ConversationMonitor } from './conversation/monitor';
 import { VoiceEngine } from './voicecmd/engine';
+import { getDefaultVoiceCommands } from './voicecmd/engine';
 import { IndexingManager } from './indexing/manager';
 
 // 导入所有handler注册函数
@@ -62,12 +63,20 @@ function onInit(): void {
   voiceEngine = new VoiceEngine(configManager, accountManager, minaService, playlistManagerMap, indexingManager);
   conversationMonitor = new ConversationMonitor(accountManager, configManager);
 
+  // 如果配置中没有语音口令配置，写入默认配置
+  const existingCommands = configManager.getVoiceCommands();
+  if (!existingCommands || existingCommands.length === 0) {
+    const defaultCommands = getDefaultVoiceCommands();
+    configManager.saveVoiceCommands(defaultCommands);
+    mimusic.log.info(`[VoiceCmd] Initialized ${defaultCommands.length} default voice commands`);
+  }
+
   // 注册所有路由
   registerAccountHandlers(router, accountManager, authService);
   registerAuthHandlers(router, authService, accountManager);
   registerDeviceHandlers(router, minaService, accountManager);
   registerPlaylistHandlers(router, playlistManagerMap, minaService, configManager);
-  registerConfigHandlers(router, configManager, conversationMonitor, scheduler);
+  registerConfigHandlers(router, configManager, conversationMonitor, scheduler, voiceEngine);
   registerConversationHandlers(router, conversationMonitor, configManager);
   registerScheduleHandlers(router, scheduler, configManager);
   registerVoiceCommandHandlers(router, configManager);
@@ -75,18 +84,22 @@ function onInit(): void {
 
   // 自动登录 + 启动后台服务
   authService.autoLoginAll();
-  indexingManager.refresh();
+  // 异步刷新索引，不阻塞插件初始化
+  setTimeout(() => {
+    indexingManager.refresh();
+  }, 100);
+
+  // 注册 VoiceEngine 回调（独立于启停生命周期）
+  conversationMonitor.registerCallback('voice_engine', (msg) => {
+    voiceEngine.handleMessage(msg);
+  });
 
   // 根据配置启动后台服务
   if (pluginConfig.scheduled_tasks_enabled) {
     scheduler.start();
   }
   if (pluginConfig.conversation_monitor_enabled) {
-    conversationMonitor.start((msg) => {
-      if (pluginConfig.voice_command_enabled) {
-        voiceEngine.handleMessage(msg);
-      }
-    });
+    conversationMonitor.start();
   }
   if (pluginConfig.voice_command_enabled) {
     voiceEngine.setEnabled(true);

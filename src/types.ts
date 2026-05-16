@@ -106,7 +106,7 @@ export interface ScheduledTask {
 }
 
 /** 任务动作类型 */
-export type TaskAction = 'play_playlist' | 'stop' | 'set_volume' | 'set_play_mode';
+export type TaskAction = 'play_playlist' | 'play_playlist_from' | 'stop' | 'set_volume' | 'set_play_mode';
 
 /** 任务调度规则 */
 export interface TaskSchedule {
@@ -116,16 +116,23 @@ export interface TaskSchedule {
   monthdays?: number[];    // 1-31
 }
 
+/** 目标设备标识（与 Go DeviceTarget 一致） */
+export interface DeviceTargetRef {
+  account_id: string;
+  device_id: string;
+}
+
 /** 任务目标设备 */
 export interface TaskTarget {
   all_managed: boolean;
-  devices: string[];       // device_id list
+  devices: DeviceTargetRef[];  // [{account_id, device_id}]
 }
 
 /** 任务参数 */
 export interface TaskParams {
   playlist_name?: string;
   playlist_id?: number;
+  song_name?: string;      // 用于 play_playlist_from 指定起始歌曲
   play_mode?: string;
   volume?: number;
 }
@@ -153,19 +160,35 @@ export interface WebhookConfig {
 
 /** 语音口令配置 */
 export interface VoiceCommand {
-  type: string;            // "play_playlist" | "stop" | "next" | "previous"
+  type: string;            // "play_playlist" | "play_song" | "set_play_mode" | "set_volume" | "next" | "previous" | "stop"
   keywords: string[];
+  param?: string;          // 附加参数（播放模式值、音量方向等）
   enabled: boolean;
 }
 
 // ===== 对话记录 =====
 
-/** 对话消息 */
+/** Mina API 返回的原始对话消息（与 WASM 版 mina.AskMessage 一致） */
+export interface AskMessage {
+  request_id?: string;
+  timestamp_ms: number;
+  response: {
+    answer: Array<{
+      domain?: string;
+      action?: string;
+      content?: string;
+      question?: string;
+      intention?: { query?: string };
+    }>;
+  };
+}
+
+/** 带设备上下文的对话消息（与 WASM 版 ConversationMessage 一致） */
 export interface ConversationMessage {
-  query: string;           // 用户说的话
-  answer: string;          // 小爱回复
-  timestamp: number;       // 毫秒时间戳
+  account_id: string;
   device_id: string;
+  device_name: string;
+  message: AskMessage;
 }
 
 // ===== 播放状态 =====
@@ -183,4 +206,7 @@ export interface PlayerStatus {
   playlist_id: number;
   current_index: number;
   current_song?: { id: number; title: string; artist: string };
+  position: number;
+  duration: number;
+  is_playing: boolean;
 }

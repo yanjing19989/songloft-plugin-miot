@@ -46,6 +46,7 @@ function validateSchedule(schedule: TaskSchedule): string | null {
 function validateTaskParams(action: TaskAction, params: TaskParams): string | null {
   switch (action) {
     case 'play_playlist':
+    case 'play_playlist_from':
       if (!params.playlist_name && !params.playlist_id) {
         return '播放歌单时必须指定歌单名称或ID';
       }
@@ -79,6 +80,12 @@ function validateTaskTarget(target: TaskTarget): string | null {
   }
   if (!target.devices || target.devices.length === 0) {
     return '请至少选择一个目标设备';
+  }
+  // 验证每个设备对象必须包含 device_id
+  for (const dev of target.devices) {
+    if (!dev || typeof dev !== 'object' || !dev.device_id) {
+      return '设备信息必须包含 device_id';
+    }
   }
   return null;
 }

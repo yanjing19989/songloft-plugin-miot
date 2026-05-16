@@ -31,6 +31,29 @@ const COMMAND_PRIORITY: Record<string, number> = {
   'stop': 7,
 };
 
+// ===== 默认口令配置 =====
+
+/**
+ * 获取默认语音口令配置（12 条）
+ * 翻译自 Go 源码: plugins/mimusic-plugin-xiaomi/config/manager.go GetDefaultVoiceCommands()
+ */
+export function getDefaultVoiceCommands(): VoiceCommand[] {
+  return [
+    { type: 'play_playlist', keywords: ['播放歌单', '放歌单'], enabled: true },
+    { type: 'play_song', keywords: ['播放歌曲', '放歌曲', '我想听'], enabled: true },
+    { type: 'set_play_mode', keywords: ['随机播放', '随机模式'], param: 'random', enabled: true },
+    { type: 'set_play_mode', keywords: ['单曲循环', '循环播放这首'], param: 'single', enabled: true },
+    { type: 'set_play_mode', keywords: ['列表循环', '循环播放'], param: 'loop', enabled: true },
+    { type: 'set_play_mode', keywords: ['顺序播放'], param: 'order', enabled: true },
+    { type: 'set_volume', keywords: ['设置音量', '音量调到', '音量', '声音', '声音调到'], param: 'absolute', enabled: true },
+    { type: 'set_volume', keywords: ['大声一点', '声音大一点', '音量大一点'], param: 'up', enabled: true },
+    { type: 'set_volume', keywords: ['小声一点', '声音小一点', '音量小一点'], param: 'down', enabled: true },
+    { type: 'next', keywords: ['下一首', '切歌', '换一首', '下一曲'], enabled: true },
+    { type: 'previous', keywords: ['上一首', '上一曲'], enabled: true },
+    { type: 'stop', keywords: ['停止播放', '停止', '别播了', '关掉音乐', '关机'], enabled: true },
+  ];
+}
+
 // ===== VoiceEngine =====
 
 /**
@@ -81,12 +104,14 @@ export class VoiceEngine {
       return;
     }
 
-    if (!msg.query || msg.query.trim() === '') {
+    // 从 AskMessage 中提取 query
+    const query = this.extractQuery(msg);
+    if (!query || query.trim() === '') {
       return;
     }
 
     // 匹配口令
-    const result = this.matchCommand(msg.query);
+    const result = this.matchCommand(query);
     if (!result) {
       return;
     }
@@ -102,6 +127,18 @@ export class VoiceEngine {
 
     // 执行口令
     this.executeCommand(result, accountId, msg.device_id);
+  }
+
+  /**
+   * 从 ConversationMessage 中提取用户 query
+   */
+  private extractQuery(msg: ConversationMessage): string {
+    const response = msg.message?.response;
+    if (!response || !response.answer || response.answer.length === 0) {
+      return '';
+    }
+    const ans = response.answer[0];
+    return ans.question || ans.intention?.query || '';
   }
 
   // ===== 私有方法 - 口令匹配 =====
@@ -160,10 +197,10 @@ export class VoiceEngine {
         this.executePlaySong(result.argument, accountId, deviceId);
         break;
       case 'set_play_mode':
-        this.executeSetPlayMode(accountId, deviceId, result.argument);
+        this.executeSetPlayMode(accountId, deviceId, result.command.param || result.argument);
         break;
       case 'set_volume':
-        this.executeSetVolume(accountId, deviceId, result.argument);
+        this.executeSetVolume(accountId, deviceId, result.command.param || 'absolute', result.argument);
         break;
       case 'next':
         this.executeNext(accountId, deviceId);
@@ -240,7 +277,8 @@ export class VoiceEngine {
 
   /**
    * 执行播放歌曲
-   * 通过 IndexingManager 搜索歌曲
+   * 通过 IndexingManager 模糊匹配歌曲名，获取所在歌单及索引，然后调用 PlaylistManager 播放
+   * 翻译自 Go 版本: voicecmd/engine.go executePlaySong
    */
   private executePlaySong(songName: string, accountId: string, deviceId: string): void {
     const pm = this.playlistManagerMap.getOrCreate(accountId, deviceId);
@@ -256,26 +294,48 @@ export class VoiceEngine {
       return;
     }
 
-    // 模糊搜索歌曲
-    const results = this.indexingManager.searchSong(songName);
-    if (results.length === 0) {
+    // 检查索引是否就绪
+    if (!this.indexingManager.isIndexReady()) {
+      mimusic.log.warn('[VoiceEngine] Song index not ready, skip play song');
+      return;
+    }
+
+    // 从索引中模糊匹配歌曲，获取歌单ID和歌曲索引
+    const loc = this.indexingManager.findSongByName(songName);
+    if (!loc) {
       mimusic.log.warn(`[VoiceEngine] Song not found: ${songName}`);
       return;
     }
 
-    const matchedSong = results[0];
-    mimusic.log.info(`[VoiceEngine] Matched song: ${matchedSong.title} - ${matchedSong.artist}`);
+    mimusic.log.info(`[VoiceEngine] Matched song: ${loc.songTitle} - ${loc.artist} playlist="${loc.playlistName}" playlistId=${loc.playlistId} songIndex=${loc.songIndex}`);
 
-    // 由于无法直接从搜索结果获取歌单ID和索引，
-    // 使用 playlistManagerMap 按当前歌单或默认歌单播放
-    // 这里简化处理：如果当前有歌单直接播放，否则提示
-    mimusic.log.info(`[VoiceEngine] Song search matched: ${matchedSong.title}`);
+    // 获取设备配置中的播放模式
+    let playMode: PlayMode = 'order';
+    const devices = this.configManager.getDevices(accountId);
+    const devCfg = devices.find(d => d.device_id === deviceId);
+    if (devCfg && devCfg.play_mode) {
+      playMode = devCfg.play_mode as PlayMode;
+    }
+
+    // 播放歌单，从匹配到的歌曲索引开始
+    const ok = pm.play(loc.playlistId, loc.songIndex, playMode);
+    if (ok) {
+      mimusic.log.info(`[VoiceEngine] Play song success: ${loc.songTitle} playlist="${loc.playlistName}" index=${loc.songIndex} mode=${playMode}`);
+    } else {
+      mimusic.log.error(`[VoiceEngine] Play song failed: ${loc.songTitle}`);
+    }
   }
 
   /**
    * 执行设置播放模式
+   * @param modeParam - 播放模式参数（来自 command.param 或 argument）
    */
   private executeSetPlayMode(accountId: string, deviceId: string, modeParam: string): void {
+    if (!modeParam) {
+      mimusic.log.warn('[VoiceEngine] Set play mode: missing mode param');
+      return;
+    }
+
     // 尝试从参数中提取播放模式
     const modeMap: Record<string, PlayMode> = {
       '顺序': 'order',
@@ -314,18 +374,48 @@ export class VoiceEngine {
   }
 
   /**
-   * 执行设置音量
-   * 支持从参数中提取数字（阿拉伯数字和中文数字）
+   * 执行设置音量（绝对值/相对值）
+   * @param param - 音量方向："absolute"|"up"|"down"
+   * @param argument - 口令关键词后的文本（用于提取数字）
    */
-  private executeSetVolume(accountId: string, deviceId: string, argument: string): void {
-    const volume = this.extractNumber(argument);
-    if (volume === null) {
-      mimusic.log.warn(`[VoiceEngine] No volume number found in: ${argument}`);
-      return;
+  private executeSetVolume(accountId: string, deviceId: string, param: string, argument: string): void {
+    // 获取当前音量（从设备配置中读取）
+    let currentVolume = 50; // 默认值
+    const accounts = this.accountManager.getAccounts();
+    for (const acc of accounts) {
+      const devices = this.configManager.getDevices(acc.id);
+      const dev = devices.find(d => d.device_id === deviceId);
+      if (dev) {
+        currentVolume = dev.volume || 50;
+        break;
+      }
+    }
+
+    let targetVolume: number;
+
+    switch (param) {
+      case 'up':
+        targetVolume = currentVolume + 10;
+        break;
+      case 'down':
+        targetVolume = currentVolume - 10;
+        break;
+      case 'absolute':
+      default: {
+        const volume = this.extractNumber(argument);
+        if (volume === null) {
+          mimusic.log.warn(`[VoiceEngine] No volume number found in: ${argument}`);
+          return;
+        }
+        targetVolume = volume;
+        break;
+      }
     }
 
     // 限制范围 0-100
-    const targetVolume = Math.max(0, Math.min(100, volume));
+    targetVolume = Math.max(0, Math.min(100, targetVolume));
+
+    mimusic.log.info(`[VoiceEngine] Set volume: current=${currentVolume} target=${targetVolume} param=${param}`);
 
     const ok = this.minaService.setVolume(accountId, deviceId, targetVolume);
     if (ok) {

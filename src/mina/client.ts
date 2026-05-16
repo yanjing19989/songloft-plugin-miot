@@ -15,7 +15,7 @@ import {
   shouldUseMinaForAsk,
   needUsePlayMusicAPI,
 } from './constants';
-import type { XiaomiTokenInfo, MinaDevice, ConversationMessage } from '../types';
+import type { XiaomiTokenInfo, MinaDevice, AskMessage } from '../types';
 import type { DeviceInfoRaw, DeviceListResponse, UbusResponse, NlpResultData, NlpInfoData, NlpDetail, ConversationData } from './models';
 
 /**
@@ -243,19 +243,30 @@ export class MinaHTTPClient {
    * @param hardware - 设备硬件型号
    * @param limit - 记录数量限制（默认2）
    */
-  getLatestAskFromXiaoai(deviceId: string, hardware: string, limit = 2): ConversationMessage[] {
+  getLatestAskFromXiaoai(deviceId: string, hardware: string, limit = 2): AskMessage[] {
+    mimusic.log.info(`[ConversationMonitor] getLatestAskFromXiaoai deviceId=${deviceId} hardware=${hardware} limit=${limit} useMinaForAsk=${shouldUseMinaForAsk(hardware)}`);
     // 部分设备需要通过 ubus 方式获取
     if (shouldUseMinaForAsk(hardware)) {
-      return this.getLatestAskByUbus(deviceId);
+      const ubusResult = this.getLatestAskByUbus(deviceId);
+      mimusic.log.info(`[ConversationMonitor] getLatestAskByUbus result: ${ubusResult ? ubusResult.length : 0} messages`);
+      return ubusResult;
     }
+
+    // 与 Go 版一致：在循环外部生成时间戳，重试时复用相同 URL
+    const timestamp = Date.now();
+    const apiUrl = formatLatestAskUrl(hardware, timestamp, limit);
+    mimusic.log.info(`[ConversationMonitor] getLatestAskFromXiaoai apiUrl=${apiUrl}`);
 
     // 大多数设备通过 xiaoai API 获取，带3次重试
     for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-      const messages = this.doGetLatestAskFromXiaoai(deviceId, hardware);
+      const messages = this.doGetLatestAskFromXiaoai(deviceId, apiUrl);
       if (messages !== null) {
+        mimusic.log.info(`[ConversationMonitor] getLatestAskFromXiaoai attempt=${attempt} success, ${messages.length} messages`);
         return messages;
       }
+      mimusic.log.info(`[ConversationMonitor] getLatestAskFromXiaoai attempt=${attempt} returned null, retrying...`);
     }
+    mimusic.log.info(`[ConversationMonitor] getLatestAskFromXiaoai all ${MAX_RETRIES} attempts failed`);
     return [];
   }
 
@@ -440,9 +451,7 @@ export class MinaHTTPClient {
   /**
    * 通过 xiaoai API 获取对话记录
    */
-  private doGetLatestAskFromXiaoai(deviceId: string, hardware: string): ConversationMessage[] | null {
-    const timestamp = Date.now();
-    const apiUrl = formatLatestAskUrl(hardware, timestamp);
+  private doGetLatestAskFromXiaoai(deviceId: string, apiUrl: string): AskMessage[] | null {
 
     const headers: Record<string, string> = {
       'User-Agent': this.userAgent,
@@ -453,11 +462,15 @@ export class MinaHTTPClient {
     try {
       const fetchResult = fetchWithRedirects(apiUrl, { method: 'GET', headers }, new CookieJar(), 0) as any;
       response = fetchResult.response;
-    } catch {
+    } catch (e) {
+      mimusic.log.info(`[ConversationMonitor] doGetLatestAskFromXiaoai fetch error: ${String(e)}`);
       return null;
     }
 
+    mimusic.log.info(`[ConversationMonitor] doGetLatestAskFromXiaoai status=${response.status}`);
+
     if (response.status === 401) {
+      mimusic.log.info(`[ConversationMonitor] doGetLatestAskFromXiaoai 401 token expired`);
       if (this.onTokenExpired) {
         this.onTokenExpired();
       }
@@ -465,27 +478,49 @@ export class MinaHTTPClient {
     }
 
     if (response.status !== 200) {
+      mimusic.log.info(`[ConversationMonitor] doGetLatestAskFromXiaoai unexpected status=${response.status}`);
       return null;
     }
 
     try {
       const text = (response as any).text() as string;
+      // 打印原始响应体（最多 1000 字符）
+      mimusic.log.info(`[ConversationMonitor] doGetLatestAskFromXiaoai raw response (${text.length} chars): ${text.substring(0, 1000)}`);
+
       const result = JSON.parse(text) as Record<string, unknown>;
 
       // data 字段是一个 JSON 字符串
       const dataStr = result['data'] as string;
-      if (!dataStr) return [];
+      if (!dataStr) {
+        mimusic.log.info(`[ConversationMonitor] doGetLatestAskFromXiaoai data field is empty/null`);
+        return [];
+      }
 
       const dataObj = JSON.parse(dataStr) as ConversationData;
-      if (!dataObj.records || dataObj.records.length === 0) return [];
+      if (!dataObj.records || dataObj.records.length === 0) {
+        mimusic.log.info(`[ConversationMonitor] doGetLatestAskFromXiaoai records empty or missing`);
+        return [];
+      }
 
-      return dataObj.records.map(record => ({
-        query: record.query,
-        answer: record.answers && record.answers.length > 0 ? record.answers[0].tts.text : '',
-        timestamp: record.time,
-        device_id: deviceId,
-      }));
-    } catch {
+      // 转换为 AskMessage 格式（与 WASM 版一致）
+      const messages = dataObj.records.map(record => {
+        // 从 answers 中找到 TTS 类型的回答，安全访问 tts.text
+        const ttsAnswer = (record.answers || []).find(a => a.type === 'TTS');
+        const answerText = ttsAnswer?.tts?.text || '';
+        return {
+          timestamp_ms: record.time,
+          response: {
+            answer: [{
+              question: record.query,
+              content: answerText,
+            }],
+          },
+        };
+      });
+      mimusic.log.info(`[ConversationMonitor] doGetLatestAskFromXiaoai parsed ${messages.length} messages`);
+      return messages;
+    } catch (e) {
+      mimusic.log.info(`[ConversationMonitor] doGetLatestAskFromXiaoai parse error: ${String(e)}`);
       return null;
     }
   }
@@ -494,7 +529,7 @@ export class MinaHTTPClient {
    * 通过 UBus nlp_result_get 获取对话记录
    * 用于不支持 xiaoai API 的设备（如 M01）
    */
-  private getLatestAskByUbus(deviceId: string): ConversationMessage[] {
+  private getLatestAskByUbus(deviceId: string): AskMessage[] {
     const result = this.ubusRequest(deviceId, 'nlp_result_get', 'mibrain', {});
     if (!result || !result.data) return [];
 
@@ -505,7 +540,7 @@ export class MinaHTTPClient {
       const infoData = JSON.parse(data.info) as NlpInfoData;
       if (!infoData.result) return [];
 
-      const messages: ConversationMessage[] = [];
+      const messages: AskMessage[] = [];
 
       for (const item of infoData.result) {
         if (!item.nlp) continue;
@@ -514,14 +549,19 @@ export class MinaHTTPClient {
           const nlp = JSON.parse(item.nlp) as NlpDetail;
           const timestamp = parseInt(nlp.meta.timestamp, 10) || 0;
 
-          for (const answer of nlp.response.answer) {
-            messages.push({
-              query: answer.intention.query,
-              answer: answer.content.to_speak,
-              timestamp,
-              device_id: deviceId,
-            });
-          }
+          // 转换为 AskMessage 格式（与 WASM 版一致）
+          messages.push({
+            request_id: nlp.meta.request_id,
+            timestamp_ms: timestamp,
+            response: {
+              answer: nlp.response.answer.map(ans => ({
+                domain: ans.domain,
+                action: ans.action,
+                content: ans.content.to_speak,
+                question: ans.intention.query,
+              })),
+            },
+          });
         } catch {
           continue;
         }

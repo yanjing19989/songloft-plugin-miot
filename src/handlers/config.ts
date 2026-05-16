@@ -6,6 +6,7 @@ import type { Router, HTTPRequest } from '@mimusic/plugin-sdk';
 import { ConfigManager } from '../config/manager';
 import { ConversationMonitor } from '../conversation/monitor';
 import { Scheduler } from '../schedule/scheduler';
+import { VoiceEngine } from '../voicecmd/engine';
 import { setHostBaseUrl } from '../utils/http';
 
 /** 解析请求体（兼容 Uint8Array 和 string） */
@@ -53,6 +54,7 @@ export function registerConfigHandlers(
   configManager: ConfigManager,
   conversationMonitor: ConversationMonitor,
   scheduler: Scheduler,
+  voiceEngine: VoiceEngine,
 ): void {
 
   // GET /config - 获取配置
@@ -98,7 +100,8 @@ export function registerConfigHandlers(
         const enabled = !!body.conversation_monitor_enabled;
         config.conversation_monitor_enabled = enabled;
         if (enabled) {
-          conversationMonitor.start();
+          conversationMonitor.stop();   // 先确保清理旧状态
+          conversationMonitor.start();  // 再干净启动
         } else {
           conversationMonitor.stop();
         }
@@ -106,7 +109,9 @@ export function registerConfigHandlers(
 
       // 更新 voice_command_enabled
       if (body.voice_command_enabled !== undefined) {
-        config.voice_command_enabled = !!body.voice_command_enabled;
+        const enabled = !!body.voice_command_enabled;
+        config.voice_command_enabled = enabled;
+        voiceEngine.setEnabled(enabled);
       }
 
       // 更新 scheduled_tasks_enabled（联动 Scheduler 启停）

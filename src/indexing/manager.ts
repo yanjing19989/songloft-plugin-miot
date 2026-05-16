@@ -13,6 +13,15 @@ export interface IndexedSong {
   artistLower: string;  // 小写化用于搜索
 }
 
+/** 歌曲在歌单中的位置信息（用于语音口令播放歌曲） */
+export interface SongLocation {
+  playlistId: number;
+  playlistName: string;
+  songIndex: number;
+  songTitle: string;
+  artist: string;
+}
+
 /** 索引中的歌单信息 */
 export interface IndexedPlaylist {
   id: number;
@@ -21,12 +30,13 @@ export interface IndexedPlaylist {
   songCount: number;
 }
 
-/** 索引状态 */
+/** 索引状态（字段名使用蛇形式，与 WASM 版保持一致） */
 export interface IndexStatus {
-  songCount: number;
-  playlistCount: number;
-  lastRefreshTime: string;
-  isRefreshing: boolean;
+  ready: boolean;
+  song_count: number;
+  playlist_count: number;
+  last_refresh_time: string;
+  is_refreshing: boolean;
 }
 
 /** 模糊搜索评分结果（内部使用） */
@@ -201,6 +211,7 @@ export class IndexingManager {
   private playlists: IndexedPlaylist[] = [];
   private lastRefreshTime: number = 0;
   private isRefreshing: boolean = false;
+  private indexReady: boolean = false;
 
   /**
    * 刷新索引（从宿主API获取最新数据）
@@ -241,11 +252,14 @@ export class IndexingManager {
       this.playlists = newPlaylists;
       this.songs = newSongs;
       this.lastRefreshTime = Date.now();
+      this.indexReady = true;
 
+      mimusic.log.info(`索引构建完成: playlists=${newPlaylists.length} songs=${newSongs.length}`);
       return { success: true, songCount: newSongs.length, playlistCount: newPlaylists.length };
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       mimusic.log.warn(`索引刷新失败: ${msg}`);
+      this.indexReady = false;
       return { success: false, songCount: this.songs.length, playlistCount: this.playlists.length };
     } finally {
       this.isRefreshing = false;
@@ -257,12 +271,13 @@ export class IndexingManager {
    */
   getStatus(): IndexStatus {
     return {
-      songCount: this.songs.length,
-      playlistCount: this.playlists.length,
-      lastRefreshTime: this.lastRefreshTime > 0
+      ready: this.indexReady,
+      song_count: this.songs.length,
+      playlist_count: this.playlists.length,
+      last_refresh_time: this.lastRefreshTime > 0
         ? new Date(this.lastRefreshTime).toISOString()
         : '',
-      isRefreshing: this.isRefreshing,
+      is_refreshing: this.isRefreshing,
     };
   }
 
@@ -334,5 +349,97 @@ export class IndexingManager {
    */
   getPlaylistById(id: number): IndexedPlaylist | null {
     return this.playlists.find(pl => pl.id === id) ?? null;
+  }
+
+  /**
+   * 在指定歌单中按歌曲名称查找索引位置
+   * 先精确匹配（忽略大小写），再回退模糊搜索
+   * @param playlistId - 歌单ID
+   * @param songName - 歌曲名称
+   * @returns { index, found }，index 为歌曲在歌单中的位置
+   */
+  findSongInPlaylist(playlistId: number, songName: string): { index: number; found: boolean } {
+    if (!this.indexReady || !songName) {
+      return { index: 0, found: false };
+    }
+
+    // 获取歌单歌曲列表
+    let songs: Array<{ id: number; title?: string; artist?: string }> = [];
+    try {
+      const result = mimusic.playlists.getSongs(playlistId);
+      if (result && Array.isArray(result)) {
+        songs = result;
+      }
+    } catch (e) {
+      mimusic.log.warn(`[IndexingManager] 获取歌单歌曲失败: ${e instanceof Error ? e.message : String(e)}`);
+      return { index: 0, found: false };
+    }
+
+    if (songs.length === 0) {
+      return { index: 0, found: false };
+    }
+
+    // 收集候选列表用于模糊匹配
+    const candidates = songs.map((s, i) => ({ title: s.title ?? '', index: i }));
+
+    // 使用 fuzzySearchList 搜索最佳匹配
+    const matched = fuzzySearchList(
+      songName,
+      candidates,
+      c => c.title,
+      1,
+    );
+
+    if (matched.length > 0) {
+      return { index: matched[0].index, found: true };
+    }
+
+    return { index: 0, found: false };
+  }
+
+  /**
+   * 按歌曲名称模糊匹配，返回歌曲位置信息（歌单ID + 索引）
+   * 参考 Go 版本: indexing/manager.go FindSongByName
+   * @param songName - 歌曲名称关键词
+   * @returns 匹配到的歌曲位置，未找到返回 null
+   */
+  findSongByName(songName: string): SongLocation | null {
+    if (!this.indexReady || !songName) return null;
+
+    // 1. 用内存歌曲索引模糊搜索匹配歌曲
+    const matchedSongs = this.searchSong(songName);
+    if (matchedSongs.length === 0) return null;
+
+    // 收集匹配歌曲的 ID 集合，用于快速查找
+    const matchedSongIds = new Set(matchedSongs.map(s => s.id));
+
+    // 2. 遍历歌单，按需加载歌曲列表查找位置
+    for (const pl of this.playlists) {
+      try {
+        const plSongs = mimusic.playlists.getSongs(pl.id, { limit: 100000 }) ?? [];
+        for (let idx = 0; idx < plSongs.length; idx++) {
+          if (matchedSongIds.has(plSongs[idx].id)) {
+            return {
+              playlistId: pl.id,
+              playlistName: pl.name,
+              songIndex: idx,
+              songTitle: plSongs[idx].title ?? '',
+              artist: plSongs[idx].artist ?? '',
+            };
+          }
+        }
+      } catch (e) {
+        mimusic.log.warn(`findSongByName: 获取歌单歌曲失败 playlist_id=${pl.id}: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * 索引是否就绪
+   */
+  isIndexReady(): boolean {
+    return this.indexReady;
   }
 }

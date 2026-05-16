@@ -1,6 +1,6 @@
 // 小米音箱插件 - 定时任务执行器
 // 翻译自 Go 源码: plugins/mimusic-plugin-xiaomi/schedule/executor.go
-// 解析目标设备，执行 play_playlist/stop/set_volume/set_play_mode 动作
+// 解析目标设备，执行 play_playlist/play_playlist_from/stop/set_volume/set_play_mode 动作
 
 /// <reference types="@mimusic/plugin-sdk" />
 
@@ -82,24 +82,50 @@ export class TaskExecutor {
       return [];
     }
 
-    // devices 是 device_id 列表，需要遍历所有账号找到对应的 accountId
+    // devices 是 [{account_id, device_id}] 对象数组
     const results: DeviceTarget[] = [];
     const accounts = this.configManager.getAccounts();
 
-    for (const deviceId of target.devices) {
+    for (const dev of target.devices) {
+      const { device_id: deviceId, account_id: accountId } = dev;
+      if (!deviceId) {
+        continue;
+      }
+
       let found = false;
-      for (const account of accounts) {
-        const device = account.devices.find(d => d.device_id === deviceId);
-        if (device) {
-          results.push({
-            accountId: account.id,
-            deviceId: device.device_id,
-            deviceName: device.device_name || device.device_id,
-          });
-          found = true;
-          break;
+
+      if (accountId) {
+        // 有 account_id，直接在指定账号下查找设备
+        const account = accounts.find(a => a.id === accountId);
+        if (account) {
+          const device = account.devices.find(d => d.device_id === deviceId);
+          if (device) {
+            results.push({
+              accountId: account.id,
+              deviceId: device.device_id,
+              deviceName: device.device_name || device.device_id,
+            });
+            found = true;
+          }
         }
       }
+
+      if (!found) {
+        // account_id 未指定或未找到，遍历所有账号查找
+        for (const account of accounts) {
+          const device = account.devices.find(d => d.device_id === deviceId);
+          if (device) {
+            results.push({
+              accountId: account.id,
+              deviceId: device.device_id,
+              deviceName: device.device_name || device.device_id,
+            });
+            found = true;
+            break;
+          }
+        }
+      }
+
       if (!found) {
         mimusic.log.warn(`[TaskExecutor] 未找到设备 device_id=${deviceId}`);
       }
@@ -151,7 +177,10 @@ export class TaskExecutor {
 
       switch (task.action) {
         case 'play_playlist':
-          message = this.executePlayPlaylist(target, task.params);
+          message = this.executePlayPlaylist(target, task.params, false);
+          break;
+        case 'play_playlist_from':
+          message = this.executePlayPlaylist(target, task.params, true);
           break;
         case 'stop':
           message = this.executeStop(target);
@@ -183,11 +212,16 @@ export class TaskExecutor {
   /**
    * 执行播放歌单动作
    * 通过歌单名称查找歌单，然后调用 PlaylistManager 播放
+   * @param withSong - 是否从指定歌曲开始播放（play_playlist_from）
    */
-  private executePlayPlaylist(target: DeviceTarget, params: TaskParams): string {
+  private executePlayPlaylist(target: DeviceTarget, params: TaskParams, withSong: boolean): string {
     const playlistName = params.playlist_name;
     if (!playlistName) {
       throw new Error('未指定歌单名称');
+    }
+
+    if (!this.indexingManager.isIndexReady()) {
+      throw new Error('歌曲索引尚未就绪，请确保已刷新索引');
     }
 
     // 通过名称查找歌单
@@ -198,16 +232,31 @@ export class TaskExecutor {
 
     mimusic.log.info(`[TaskExecutor] 匹配到歌单 name=${playlistName} matched=${playlist.name} id=${playlist.id}`);
 
+    // 确定起始位置
+    let startIndex = 0;
+    if (withSong && params.song_name) {
+      const result = this.indexingManager.findSongInPlaylist(playlist.id, params.song_name);
+      if (result.found) {
+        startIndex = result.index;
+        mimusic.log.info(`[TaskExecutor] 匹配到歌曲 song_name=${params.song_name} index=${startIndex}`);
+      } else {
+        mimusic.log.warn(`[TaskExecutor] 未找到匹配的歌曲，从第一首开始 song_name=${params.song_name}`);
+      }
+    }
+
     // 确定播放模式
     const playMode: PlayMode = (params.play_mode as PlayMode) || 'order';
 
     // 获取或创建设备的播放管理器并开始播放
     const pm = this.playlistManagerMap.getOrCreate(target.accountId, target.deviceId);
-    const ok = pm.play(playlist.id, 0, playMode);
+    const ok = pm.play(playlist.id, startIndex, playMode);
     if (!ok) {
       throw new Error(`播放歌单失败: ${playlist.name}`);
     }
 
+    if (withSong && params.song_name) {
+      return `播放歌单「${playlist.name}」（从「${params.song_name}」开始）成功`;
+    }
     return `播放歌单「${playlist.name}」成功`;
   }
 

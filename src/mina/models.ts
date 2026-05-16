@@ -120,7 +120,8 @@ export interface ConversationRecord {
   time: number;
   query: string;
   answers: Array<{
-    tts: { text: string };
+    type: string;  // "TTS" | "AUDIO" 等
+    tts?: { text: string };
   }>;
 }
 

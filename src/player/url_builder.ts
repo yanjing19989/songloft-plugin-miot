@@ -23,7 +23,7 @@ export class URLBuilder {
     // 后端 MarshalJSON 已将 song.url 统一为 /api/v1/songs/{id}/play
     // 不再需要判断 type 或手动构建 Base62 编码路径
     const songUrl = song.url || '';
-    
+
     if (!songUrl) {
       return '';
     }
@@ -38,32 +38,5 @@ export class URLBuilder {
     const accessToken = await mimusic.plugin.getToken();
     const separator = songUrl.includes('?') ? '&' : '?';
     return serverHost + songUrl + separator + 'access_token=' + accessToken;
-  }
-
-  /**
-   * 构造封面URL
-   * 
-   * 新架构(2026):后端 MarshalJSON 已统一处理 CoverURL 字段:
-   * - 本地歌曲: /api/v1/songs/{id}/cover
-   * - 网络歌曲: 保留原始 CoverURL (外部 CDN)
-   * 
-   * @param coverUrl 后端返回的 coverUrl 字段(已统一处理)
-   * @returns 封面 URL
-   */
-  static async buildCoverURL(coverUrl: string): Promise<string> {
-    if (!coverUrl) {
-      return '';
-    }
-
-    // 外部 URL 直接返回
-    if (coverUrl.startsWith('http://') || coverUrl.startsWith('https://')) {
-      return coverUrl;
-    }
-
-    // 本地歌曲: /api/v1/songs/{id}/cover,需要附加 access_token
-    const serverHost = getHostBaseUrl();
-    const accessToken = await mimusic.plugin.getToken();
-    const separator = coverUrl.includes('?') ? '&' : '?';
-    return serverHost + coverUrl + separator + 'access_token=' + accessToken;
   }
 }

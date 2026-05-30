@@ -133,7 +133,7 @@ export class MinaHTTPClient {
    * 使用 player_play_music 播放 URL（用于部分设备型号）
    */
   async playByMusicURL(deviceId: string, audioUrl: string): Promise<boolean> {
-    const audioId = '1582971365183456177';
+    const audioId = '2001539591212892499';
     const cpId = '355454500';
 
     const music = {
